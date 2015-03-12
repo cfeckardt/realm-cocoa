@@ -19,18 +19,42 @@
 #import "RLMObject_Private.hpp"
 
 #import "RLMAccessor.h"
+#import "RLMArray.h"
 #import "RLMObjectSchema_Private.hpp"
+#import "RLMObjectStore.h"
 #import "RLMProperty_Private.h"
 #import "RLMRealm_Private.hpp"
 #import "RLMSchema_Private.h"
-
-#import "RLMObjectStore.h"
 #import "RLMSwiftSupport.h"
 #import "RLMUtil.hpp"
 
+@implementation RLMObservable {
+    RLMRealm *_realm;
+    RLMObjectSchema *_objectSchema;
+}
+- (instancetype)initWithRow:(realm::Row const&)row realm:(RLMRealm *)realm schema:(RLMObjectSchema *)objectSchema {
+    self = [super init];
+    if (self) {
+        _row = row;
+        _realm = realm;
+        _objectSchema = objectSchema;
+    }
+    return self;
+}
+
+- (id)valueForKey:(NSString *)key {
+    RLMObject *obj = [[RLMObject alloc] initWithRealm:_realm schema:_objectSchema];
+    obj->_row = _row;
+    return RLMDynamicGet(obj, key);
+}
+@end
+
 const NSUInteger RLMDescriptionMaxDepth = 5;
 
-@implementation RLMObjectBase
+@implementation RLMObjectBase {
+    @public
+    NSMutableArray *_observers;
+}
 
 // standalone init
 - (instancetype)init {
@@ -181,9 +205,86 @@ const NSUInteger RLMDescriptionMaxDepth = 5;
     }
 }
 
+- (id)mutableArrayValueForKey:(NSString *)key {
+    id obj = [self valueForKey:key];
+    if ([obj isKindOfClass:[RLMArray class]]) {
+        return obj;
+    }
+    return [super mutableArrayValueForKey:key];
+}
+
+static NSString *keyFromPath(NSString *keyPath) {
+    NSUInteger sep = [keyPath rangeOfString:@"."].location;
+    return sep == NSNotFound ? keyPath : [keyPath substringToIndex:sep];
+}
+
+static RLMObservable *getObservable(RLMObjectSchema *objectSchema, RLMRealm *realm, realm::Row const& row) {
+    for (RLMObservable *o in objectSchema->_observers) {
+        if (o->_row.get_index() == row.get_index()) {
+            return o;
+        }
+    }
+
+    RLMObservable *observable = [[RLMObservable alloc] initWithRow:row realm:realm schema:objectSchema];
+    if (!objectSchema->_observers) {
+        objectSchema->_observers = [NSMutableArray new];
+    }
+    [objectSchema->_observers addObject:observable];
+    return observable;
+}
+
+- (void)addObserver:(id)observer
+         forKeyPath:(NSString *)keyPath
+            options:(NSKeyValueObservingOptions)options
+            context:(void *)context {
+    NSString *key = keyFromPath(keyPath);
+    if (!_objectSchema[key]) {
+        [super addObserver:observer forKeyPath:keyPath options:options context:context];
+        return;
+    }
+
+    RLMObservable *observable = getObservable(_objectSchema, _realm, _row);
+    [observable addObserver:observer forKeyPath:keyPath options:options context:context];
+}
+
+- (void)removeObserver:(NSObject *)observer forKeyPath:(NSString *)keyPath {
+    if (_objectSchema[keyFromPath(keyPath)]) {
+        [getObservable(_objectSchema, _realm, _row) removeObserver:observer forKeyPath:keyPath];
+    }
+    else {
+        [super removeObserver:observer forKeyPath:keyPath];
+    }
+}
+
+- (void)removeObserver:(NSObject *)observer forKeyPath:(NSString *)keyPath context:(void *)context {
+    if (_objectSchema[keyFromPath(keyPath)]) {
+        [getObservable(_objectSchema, _realm, _row) removeObserver:observer forKeyPath:keyPath context:context];
+    }
+    else {
+        [super removeObserver:observer forKeyPath:keyPath context:context];
+    }
+}
+
 @end
 
+void RLMWillChange(RLMObjectBase *obj, NSString *key) {
+    [getObservable(obj->_objectSchema, obj->_realm, obj->_row) willChangeValueForKey:key];
+}
 
+void RLMDidChange(RLMObjectBase *obj, NSString *key) {
+    [getObservable(obj->_objectSchema, obj->_realm, obj->_row) didChangeValueForKey:key];
+}
+
+void RLMWillChange(RLMObjectBase *obj, NSString *key, NSKeyValueChange kind, NSIndexSet *indices) {
+    [getObservable(obj->_objectSchema, obj->_realm, obj->_row) willChange:kind valuesAtIndexes:indices forKey:key];
+}
+
+void RLMDidChange(RLMObjectBase *obj, NSString *key, NSKeyValueChange kind, NSIndexSet *indices) {
+    [getObservable(obj->_objectSchema, obj->_realm, obj->_row) didChange:kind valuesAtIndexes:indices forKey:key];
+}
+
+@implementation RLMObservationInfo
+@end
 
 void RLMObjectBaseSetRealm(__unsafe_unretained RLMObjectBase *object, __unsafe_unretained RLMRealm *realm) {
     if (object) {
@@ -325,3 +426,96 @@ Class RLMObjectUtilClass(BOOL isSwift) {
 }
 
 @end
+
+void RLMOverrideStandaloneMethods(Class cls) {
+    struct methodInfo {
+        SEL sel;
+        IMP imp;
+        const char *type;
+    };
+
+    auto get = [](SEL sel) {
+        Method m = class_getInstanceMethod(NSObject.class, sel);
+        IMP imp = method_getImplementation(m);
+        const char *type = method_getTypeEncoding(m);
+        return methodInfo{sel, imp, type};
+    };
+
+    auto make = [](SEL sel, auto&& func) {
+        Method m = class_getInstanceMethod(NSObject.class, sel);
+        IMP superImp = method_getImplementation(m);
+        const char *type = method_getTypeEncoding(m);
+        IMP imp = imp_implementationWithBlock(func(sel, superImp));
+        return methodInfo{sel, imp, type};
+    };
+
+    static const methodInfo methods[] = {
+        get(@selector(willChangeValueForKey:)),
+        get(@selector(willChange:valuesAtIndexes:forKey:)),
+        get(@selector(didChangeValueForKey:)),
+        get(@selector(didChange:valuesAtIndexes:forKey:)),
+
+        make(@selector(addObserver:forKeyPath:options:context:), [](SEL sel, IMP superImp) {
+            auto superFn = (void (*)(id, SEL, id, NSString *, NSKeyValueObservingOptions, void *))superImp;
+            return ^(RLMObjectBase *self, id observer, NSString *keyPath, NSKeyValueObservingOptions options, void *context) {
+                if (!self->_observers)
+                    self->_observers = [NSMutableArray new];
+
+                RLMObservationInfo *info = [RLMObservationInfo new];
+                info.observer = observer;
+                info.options = options;
+                info.context = context;
+                info.key = keyPath;
+                [self->_observers addObject:info];
+                superFn(self, sel, observer, keyPath, options, context);
+            };
+        }),
+
+        make(@selector(removeObserver:forKeyPath:), [](SEL sel, IMP superImp) {
+            auto superFn = (void (*)(id, SEL, id, NSString *))superImp;
+            return ^(RLMObjectBase *self, id observer, NSString *keyPath) {
+                for (RLMObservationInfo *info in self->_observers) {
+                    if (info.observer == observer && [info.key isEqualToString:keyPath]) {
+                        [self->_observers removeObject:info];
+                        break;
+                    }
+                }
+                superFn(self, sel, observer, keyPath);
+            };
+        }),
+
+        make(@selector(removeObserver:forKeyPath:context:), [](SEL sel, IMP superImp) {
+            auto superFn = (void (*)(id, SEL, id, NSString *, void *))superImp;
+            return ^(RLMObjectBase *self, id observer, NSString *keyPath, void *context) {
+                for (RLMObservationInfo *info in self->_observers) {
+                    if (info.observer == observer && info.context == context && [info.key isEqualToString:keyPath]) {
+                        [self->_observers removeObject:info];
+                        break;
+                    }
+                }
+                superFn(self, sel, observer, keyPath, context);
+            };
+        })
+    };
+
+    for (auto const& m : methods)
+        class_addMethod(cls, m.sel, m.imp, m.type);
+}
+
+void RLMConvertStandaloneToAccessor(RLMObjectBase *obj, Class accessorClass) {
+    NSMutableArray *observers = obj->_observers;
+    obj->_observers = nil;
+
+    for (RLMObservationInfo *info in observers) {
+        [obj removeObserver:info.observer forKeyPath:info.key context:info.context];
+    }
+
+    object_setClass(obj, accessorClass);
+
+    for (RLMObservationInfo *info in observers) {
+        [obj addObserver:info.observer
+              forKeyPath:info.key
+                 options:info.options & ~NSKeyValueObservingOptionInitial
+                 context:info.context];
+    }
+}

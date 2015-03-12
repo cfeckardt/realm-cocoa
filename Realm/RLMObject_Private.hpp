@@ -21,6 +21,13 @@
 #import <realm/link_view.hpp> // required by row.hpp
 #import <realm/row.hpp>
 
+@interface RLMObservable : NSObject {
+    @public
+    realm::Row _row;
+}
+@property (nonatomic) void *observationInfo;
+@end
+
 // RLMObject accessor and read/write realm
 @interface RLMObjectBase () {
     @public
@@ -28,3 +35,12 @@
 }
 
 @end
+
+void RLMOverrideStandaloneMethods(Class cls);
+void RLMConvertStandaloneToAccessor(RLMObjectBase *obj, Class accessorClass);
+
+void RLMWillChange(RLMObjectBase *obj, NSString *key);
+void RLMDidChange(RLMObjectBase *obj, NSString *key);
+
+void RLMWillChange(RLMObjectBase *obj, NSString *key, NSKeyValueChange kind, NSIndexSet *indices);
+void RLMDidChange(RLMObjectBase *obj, NSString *key, NSKeyValueChange kind, NSIndexSet *indices);

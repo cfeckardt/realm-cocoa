@@ -28,16 +28,28 @@
 
 #import <realm/link_view.hpp>
 
+static void changeArray(__unsafe_unretained RLMArray *const ar, NSKeyValueChange kind, NSUInteger index, dispatch_block_t f) {
+    NSIndexSet *is = [NSIndexSet indexSetWithIndex:index];
+    [ar->_parentObject willChange:kind valuesAtIndexes:is forKey:ar->_key];
+    f();
+    [ar->_parentObject didChange:kind valuesAtIndexes:is forKey:ar->_key];
+}
+
 @implementation RLMArray {
     // array for standalone
     NSMutableArray *_backingArray;
 }
 
-- (instancetype)initWithObjectClassName:(NSString *)objectClassName standalone:(BOOL)standalone {
+- (instancetype)initWithObjectClassName:(NSString *)objectClassName
+                           parentObject:(RLMObjectBase *)object
+                                    key:(NSString *)key {
     self = [super init];
     if (self) {
         _objectClassName = objectClassName;
-        if (standalone) {
+        _parentObject = object;
+        _key = key;
+
+        if (_parentObject && !_parentObject->_realm) {
             _backingArray = [[NSMutableArray alloc] init];
         }
     }
@@ -45,7 +57,7 @@
 }
 
 - (instancetype)initWithObjectClassName:(NSString *)objectClassName {
-    return [self initWithObjectClassName:objectClassName standalone:YES];
+    return [self initWithObjectClassName:objectClassName parentObject:nil key:nil];
 }
 
 //
@@ -127,16 +139,22 @@ static void RLMValidateMatchingObjectType(RLMArray *array, RLMObject *object) {
 
 - (void)insertObject:(RLMObject *)anObject atIndex:(NSUInteger)index {
     RLMValidateMatchingObjectType(self, anObject);
-    [_backingArray insertObject:anObject atIndex:index];
+    changeArray(self, NSKeyValueChangeInsertion, index, ^{
+        [_backingArray insertObject:anObject atIndex:index];
+    });
 }
 
 - (void)removeObjectAtIndex:(NSUInteger)index {
-    [_backingArray removeObjectAtIndex:index];
+    changeArray(self, NSKeyValueChangeRemoval, index, ^{
+        [_backingArray removeObjectAtIndex:index];
+    });
 }
 
 - (void)replaceObjectAtIndex:(NSUInteger)index withObject:(id)anObject {
     RLMValidateMatchingObjectType(self, anObject);
-    [_backingArray replaceObjectAtIndex:index withObject:anObject];
+    changeArray(self, NSKeyValueChangeReplacement, index, ^{
+        [_backingArray replaceObjectAtIndex:index withObject:anObject];
+    });
 }
 
 - (NSUInteger)indexOfObject:(RLMObject *)object {
@@ -153,7 +171,7 @@ static void RLMValidateMatchingObjectType(RLMArray *array, RLMObject *object) {
 
 - (void)deleteObjectsFromRealm {
     for (RLMObject *obj in _backingArray) {
-        RLMDeleteObjectFromRealm(obj, _realm);
+        RLMDeleteObjectFromRealm(obj, obj->_realm);
     }
 }
 
@@ -175,6 +193,10 @@ static void RLMValidateMatchingObjectType(RLMArray *array, RLMObject *object) {
 
 - (void)setValue:(id)value forKey:(NSString *)key {
     [_backingArray setValue:value forKey:key];
+}
+
+- (NSArray *)objectsAtIndexes:(NSIndexSet *)indexes {
+    return [_backingArray objectsAtIndexes:indexes];
 }
 
 //

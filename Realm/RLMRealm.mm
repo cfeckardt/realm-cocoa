@@ -23,6 +23,7 @@
 #import "RLMObject_Private.h"
 #import "RLMObjectSchema_Private.hpp"
 #import "RLMObjectStore.h"
+#import "RLMObject_Private.hpp"
 #import "RLMQueryUtil.hpp"
 #import "RLMRealmUtil.h"
 #import "RLMSchema_Private.h"
@@ -594,6 +595,214 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
     [_notifier stop];
 }
 
+struct ObserverState {
+    size_t table;
+    size_t row;
+    size_t column;
+    NSString *key;
+    __unsafe_unretained RLMObservable *observable;
+
+    bool changed = false;
+    std::vector<std::pair<NSKeyValueChange, NSMutableIndexSet *>> linkview_changes;
+    ObserverState *next = nullptr;
+};
+
+class ModifiedRowParser {
+    size_t current_table = 0;
+    std::vector<ObserverState>& observers;
+    ObserverState *active_linklist = nullptr;
+
+public:
+    ModifiedRowParser(std::vector<ObserverState>& observers) : observers(observers) { }
+
+    void parse_complete() {
+        for (auto& o : observers) {
+            if (!o.changed)
+                continue;
+            if (o.linkview_changes.size() != 1)
+                [o.observable willChangeValueForKey:o.key];
+            else
+                [o.observable willChange:o.linkview_changes[0].first
+                       valuesAtIndexes:o.linkview_changes[0].second
+                                forKey:o.key];
+        }
+    }
+
+    // These would require having an observer before schema init
+    // Maybe do something here to throw an error when multiple processes have different schemas?
+    bool insert_group_level_table(size_t, size_t, StringData) noexcept { return false; }
+    bool erase_group_level_table(size_t, size_t) noexcept { return false; }
+    bool rename_group_level_table(size_t, StringData) noexcept { return false; }
+    bool insert_column(size_t, DataType, StringData, bool) { return false; }
+    bool insert_link_column(size_t, DataType, StringData, size_t, size_t) { return false; }
+    bool erase_column(size_t) { return false; }
+    bool erase_link_column(size_t, size_t, size_t) { return false; }
+    bool rename_column(size_t, StringData) { return false; }
+    bool add_search_index(size_t) { return false; }
+    bool remove_search_index(size_t) { return false; }
+    bool add_primary_key(size_t) { return false; }
+    bool remove_primary_key() { return false; }
+    bool set_link_type(size_t, LinkType) { return false; }
+
+    bool select_table(size_t group_level_ndx, int, const size_t*) noexcept {
+        current_table = group_level_ndx;
+        return true;
+    }
+
+    bool insert_empty_rows(size_t, size_t, size_t, bool) {
+        // rows are only inserted at the end, so no need to do anything
+        return true;
+    }
+
+    // update linkview?
+    bool erase_rows(size_t row_ndx, size_t, size_t last_row_ndx, bool unordered) noexcept {
+        for (auto& o : observers) {
+            if (o.table == current_table) {
+                if (o.row == row_ndx) {
+                    o.row = realm::npos;
+                    o.changed = false;
+                }
+                else if (unordered && o.row == last_row_ndx) {
+                    o.row = row_ndx;
+                }
+                else if (!unordered && o.row > row_ndx && o.row != realm::npos) {
+                    o.row -= 1;
+                }
+            }
+        }
+        return true;
+    }
+
+    // update linkview?
+    bool clear_table() noexcept {
+        for (auto& o : observers) {
+            if (o.table == current_table) {
+                o.row = realm::npos;
+                o.changed = false;
+            }
+        }
+        return true;
+    }
+
+    bool select_link_list(size_t col, size_t row) {
+        active_linklist = nullptr;
+        for (auto& o : observers) {
+            if (o.table == current_table && o.row == row && o.column == col) {
+                o.next = active_linklist;
+                active_linklist = &o;
+            }
+        }
+        return true;
+    }
+
+    void append_link_list_change(NSKeyValueChange kind, NSUInteger index) {
+        for (ObserverState *o = active_linklist; o; o = o->next) {
+            if (o->linkview_changes.empty() || o->linkview_changes.back().first != kind) {
+                o->linkview_changes.push_back(std::make_pair(kind, [NSMutableIndexSet new]));
+            }
+            [o->linkview_changes.back().second addIndex:index];
+            o->changed = true;
+        }
+
+    }
+
+    bool link_list_set(size_t index, size_t) {
+        append_link_list_change(NSKeyValueChangeReplacement, index);
+        return true;
+    }
+
+    bool link_list_insert(size_t index, size_t) {
+        append_link_list_change(NSKeyValueChangeInsertion, index);
+        return true;
+    }
+
+    bool link_list_erase(size_t index) {
+        append_link_list_change(NSKeyValueChangeRemoval, index);
+        return true;
+    }
+    bool link_list_clear() { return true; }
+
+    bool link_list_move(size_t, size_t) { return true; }
+
+    // Things that just mark the field as modified
+    bool set_int(size_t col, size_t row, int_fast64_t) { return mark_dirty(row, col); }
+    bool set_bool(size_t col, size_t row, bool) { return mark_dirty(row, col); }
+    bool set_float(size_t col, size_t row, float) { return mark_dirty(row, col); }
+    bool set_double(size_t col, size_t row, double) { return mark_dirty(row, col); }
+    bool set_string(size_t col, size_t row, StringData) { return mark_dirty(row, col); }
+    bool set_binary(size_t col, size_t row, BinaryData) { return mark_dirty(row, col); }
+    bool set_date_time(size_t col, size_t row, DateTime) { return mark_dirty(row, col); }
+    bool set_table(size_t col, size_t row) { return mark_dirty(row, col); }
+    bool set_mixed(size_t col, size_t row, const Mixed&) { return mark_dirty(row, col); }
+    bool set_link(size_t col, size_t row, size_t) { return mark_dirty(row, col); }
+
+    // Things we don't need to do anything for
+    bool select_descriptor(int, const size_t*) { return true; }
+
+    // Things that we don't do in the binding
+    bool row_insert_complete() { return false; }
+    bool optimize_table() { return false; }
+    bool add_int_to_column(size_t, int_fast64_t) { return false; }
+    bool insert_int(size_t, size_t, size_t, int_fast64_t) { return false; }
+    bool insert_bool(size_t, size_t, size_t, bool) { return false; }
+    bool insert_float(size_t, size_t, size_t, float) { return false; }
+    bool insert_double(size_t, size_t, size_t, double) { return false; }
+    bool insert_string(size_t, size_t, size_t, StringData) { return false; }
+    bool insert_binary(size_t, size_t, size_t, BinaryData) { return false; }
+    bool insert_date_time(size_t, size_t, size_t, DateTime) { return false; }
+    bool insert_table(size_t, size_t, size_t) { return false; }
+    bool insert_mixed(size_t, size_t, size_t, const Mixed&) { return false; }
+    bool insert_link(size_t, size_t, size_t, size_t) { return false; }
+    bool insert_link_list(size_t, size_t, size_t) { return false; }
+
+private:
+    bool mark_dirty(size_t row_ndx, size_t col_ndx) {
+        for (auto& o : observers) {
+            if (o.table == current_table && o.row == row_ndx && o.column == col_ndx) {
+                o.changed = true;
+            }
+        }
+        return true;
+    }
+};
+
+static void advance_notify(SharedGroup *sg, RLMSchema *schema) {
+    std::vector<ObserverState> observers;
+    // all this should maybe be precomputed or cached or something
+    for (RLMObjectSchema *objectSchema in schema.objectSchema) {
+        for (RLMObservable *observable in objectSchema->_observers) {
+            auto const& row = observable->_row;
+            for (size_t i = 0; i < objectSchema.properties.count; ++i) {
+                observers.push_back({
+                    row.get_table()->get_index_in_group(),
+                    row.get_index(),
+                    i,
+                    [objectSchema.properties[i] name],
+                    observable});
+            }
+        }
+    }
+
+    if (observers.empty()) {
+        LangBindHelper::advance_read(*sg);
+        return;
+    }
+
+    ModifiedRowParser m(observers);
+    LangBindHelper::advance_read(*sg, m);
+
+    for (auto const& o : observers) {
+        if (!o.changed)
+            continue;
+        if (o.linkview_changes.size() != 1)
+            [o.observable didChangeValueForKey:o.key];
+        else
+            [o.observable didChange:o.linkview_changes[0].first
+                  valuesAtIndexes:o.linkview_changes[0].second
+                           forKey:o.key];
+    }
+}
+
 - (void)handleExternalCommit {
     RLMCheckThread(self);
     NSAssert(!_readOnly, @"Read-only realms do not have notifications");
@@ -601,7 +810,7 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
         if (_sharedGroup->has_changed()) { // Throws
             if (_autorefresh) {
                 if (_group) {
-                    LangBindHelper::advance_read(*_sharedGroup);
+                    advance_notify(_sharedGroup.get(), _schema);
                 }
                 [self sendNotifications:RLMRealmDidChangeNotification];
             }
@@ -628,7 +837,7 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
         // advance transaction if database has changed
         if (_sharedGroup->has_changed()) { // Throws
             if (_group) {
-                LangBindHelper::advance_read(*_sharedGroup);
+                advance_notify(_sharedGroup.get(), _schema);
             }
             else {
                 // Create the read transaction

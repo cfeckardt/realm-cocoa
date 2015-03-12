@@ -18,6 +18,9 @@
 
 #import "RLMObjectSchema_Private.h"
 
+#import <realm/row.hpp>
+#import <vector>
+
 namespace realm {
     class Table;
     template<typename T> class BasicTableRef;
