@@ -534,15 +534,23 @@ case "$COMMAND" in
     "cocoapods-setup")
         sh build.sh download-core
 
-        # CocoaPods seems to not like symlinks
-        mv core tmp
-        mv $(readlink tmp) core
-        rm tmp
+        # CocoaPods doesn't support symlinks
+        if [ -L core ]; then
+            mv core core-tmp
+            mv $(readlink core-tmp) core
+            rm core-tmp
+        fi
 
         # CocoaPods doesn't support multiple header_mappings_dir, so combine
         # both sets of headers into a single directory
         rm -rf include
-        mv core/include include
+        if [ -d ../realm-core ]; then
+            # pod lib lint
+            cp -R core/include include
+        else
+            # pod spec lint / pod install
+            mv core/include include
+        fi
         mkdir -p include/Realm
         cp Realm/*.{h,hpp} include/Realm
         touch include/Realm/RLMPlatform.h
