@@ -434,13 +434,6 @@ void RLMOverrideStandaloneMethods(Class cls) {
         const char *type;
     };
 
-    auto get = [](SEL sel) {
-        Method m = class_getInstanceMethod(NSObject.class, sel);
-        IMP imp = method_getImplementation(m);
-        const char *type = method_getTypeEncoding(m);
-        return methodInfo{sel, imp, type};
-    };
-
     auto make = [](SEL sel, auto&& func) {
         Method m = class_getInstanceMethod(NSObject.class, sel);
         IMP superImp = method_getImplementation(m);
@@ -450,11 +443,6 @@ void RLMOverrideStandaloneMethods(Class cls) {
     };
 
     static const methodInfo methods[] = {
-        get(@selector(willChangeValueForKey:)),
-        get(@selector(willChange:valuesAtIndexes:forKey:)),
-        get(@selector(didChangeValueForKey:)),
-        get(@selector(didChange:valuesAtIndexes:forKey:)),
-
         make(@selector(addObserver:forKeyPath:options:context:), [](SEL sel, IMP superImp) {
             auto superFn = (void (*)(id, SEL, id, NSString *, NSKeyValueObservingOptions, void *))superImp;
             return ^(RLMObjectBase *self, id observer, NSString *keyPath, NSKeyValueObservingOptions options, void *context) {
