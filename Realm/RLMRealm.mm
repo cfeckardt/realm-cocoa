@@ -296,7 +296,7 @@ static NSString * const c_defaultRealmFileName = @"default.realm";
 
 + (instancetype)defaultRealm
 {
-    return [RLMRealm realmWithPath:[RLMRealm defaultRealmPath] readOnly:NO error:nil];
+    return [self realmWithPath:[self defaultRealmPath] readOnly:NO error:nil];
 }
 
 + (instancetype)realmWithPath:(NSString *)path
